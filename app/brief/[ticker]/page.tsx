@@ -1,254 +1,281 @@
-import { getCompanyBrief } from "@/lib/companyData";
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+import { useSearchParams } from "next/navigation";
 import TopNav from "@/components/TopNav";
 import SideNav from "@/components/SideNav";
-import Footer from "@/components/Footer";
-import type { Metadata } from "next";
+import LoadingSteps from "@/components/LoadingSteps";
+import BriefDisplay from "@/components/BriefDisplay";
+import QuickBriefDisplay from "@/components/QuickBriefDisplay";
+import { BriefResult, FullBriefResult, QuickBriefResult, WatchlistItem } from "@/lib/types";
+
+// Detect if a slug looks like a Supabase share slug (ends in -xxxxxx, 6 alphanum chars)
+function isShareSlug(slug: string): boolean {
+  return /^.+-[a-z0-9]{6}$/.test(slug);
+}
+
+function getWatchlist(): WatchlistItem[] {
+  if (typeof window === "undefined") return [];
+  try {
+    return JSON.parse(localStorage.getItem("brief_watchlist") || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveToWatchlist(item: WatchlistItem) {
+  const list = getWatchlist();
+  const updated = [item, ...list.filter((i) => i.id !== item.id)];
+  localStorage.setItem("brief_watchlist", JSON.stringify(updated));
+}
 
 interface Props {
   params: { ticker: string };
 }
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const company = getCompanyBrief(params.ticker);
-  return {
-    title: company
-      ? `Brief | ${company.name} (${company.ticker})`
-      : `Brief | ${params.ticker.toUpperCase()}`,
-  };
-}
-
 export default function BriefPage({ params }: Props) {
-  const ticker = params.ticker.toUpperCase();
-  const company = getCompanyBrief(ticker);
+  const slug = decodeURIComponent(params.ticker);
+  const searchParams = useSearchParams();
+  const mode = searchParams.get("mode") || "full";
 
-  if (!company) {
-    return (
-      <>
-        <TopNav showSearch />
-        <SideNav />
-        <main className="ml-64 pt-16 min-h-screen">
-          <div className="max-w-container-max mx-auto px-margin-desktop py-12 flex flex-col items-center justify-center h-[80vh]">
-            <span className="material-symbols-outlined text-6xl text-on-tertiary-fixed-variant mb-6">
-              search_off
-            </span>
-            <h1 className="font-headline-lg text-headline-lg text-on-surface mb-2">
-              No Brief Found
-            </h1>
-            <p className="font-body-md text-on-surface-variant">
-              We don&apos;t have intelligence data for{" "}
-              <span className="text-primary font-data-mono">{ticker}</span> yet.
-            </p>
-          </div>
-        </main>
-      </>
-    );
+  const [stepStatuses, setStepStatuses] = useState<("idle" | "loading" | "done")[]>([
+    "idle", "idle", "idle", "idle",
+  ]);
+  const [currentStep, setCurrentStep] = useState(0);
+  const [brief, setBrief] = useState<BriefResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isShared, setIsShared] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [shareToast, setShareToast] = useState(false);
+  const [saveToast, setSaveToast] = useState(false);
+
+  const hasFetched = useRef(false);
+
+  useEffect(() => {
+    if (hasFetched.current) return;
+    hasFetched.current = true;
+    loadBrief();
+  }, [slug]);
+
+  async function loadBrief() {
+    // If this looks like a Supabase share slug, try fetching it first
+    if (isShareSlug(slug)) {
+      try {
+        const res = await fetch(`/api/shared/${slug}`);
+        if (res.ok) {
+          const data = await res.json();
+          setBrief(data.brief_data as BriefResult);
+          setIsShared(true);
+          setCurrentStep(4);
+          setStepStatuses(["done", "done", "done", "done"]);
+          return;
+        }
+      } catch {
+        // Not a shared slug, fall through to generate
+      }
+    }
+
+    // Generate fresh brief via streaming SSE
+    setStepStatuses(["loading", "idle", "idle", "idle"]);
+    setCurrentStep(1);
+
+    try {
+      const res = await fetch("/api/brief", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: slug, mode }),
+      });
+
+      if (!res.ok || !res.body) {
+        setError("Failed to connect to Brief service. Please try again.");
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            handleStreamEvent(event);
+          } catch {
+            // Malformed event, skip
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Stream error:", err);
+      setError("Brief generation failed. Please try again.");
+    }
   }
+
+  function handleStreamEvent(event: Record<string, unknown>) {
+    if (event.event === "step") {
+      const step = event.step as number;
+      const status = event.status as "loading" | "done";
+      setCurrentStep(step);
+      setStepStatuses((prev) => {
+        const updated = [...prev] as ("idle" | "loading" | "done")[];
+        updated[step - 1] = status;
+        return updated;
+      });
+    } else if (event.event === "result") {
+      setBrief(event.data as BriefResult);
+      setStepStatuses(["done", "done", "done", "done"]);
+      setCurrentStep(4);
+    } else if (event.event === "error") {
+      setError(event.message as string);
+    }
+  }
+
+  async function handleShare() {
+    if (!brief) return;
+    const name =
+      brief.type === "quick"
+        ? brief.name
+        : brief.detection.name;
+    const type = brief.type === "quick" ? "quick" : brief.type;
+
+    try {
+      const res = await fetch("/api/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ briefData: brief, name, type }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setShareUrl(data.url);
+        await navigator.clipboard.writeText(data.url).catch(() => {});
+        setShareToast(true);
+        setTimeout(() => setShareToast(false), 3000);
+      }
+    } catch (err) {
+      console.error("Share failed:", err);
+    }
+  }
+
+  function handleSave() {
+    if (!brief) return;
+    const name =
+      brief.type === "quick"
+        ? brief.name
+        : brief.detection.name;
+    const type = brief.type === "quick" ? "quick" : brief.type;
+
+    const item: WatchlistItem = {
+      id: `${Date.now()}`,
+      name,
+      type,
+      savedAt: new Date().toISOString(),
+      slug,
+      briefData: brief,
+    };
+    saveToWatchlist(item);
+    setSaveToast(true);
+    setTimeout(() => setSaveToast(false), 3000);
+  }
+
+  const briefType =
+    brief && brief.type !== "quick"
+      ? (brief as FullBriefResult).detection.type
+      : "company";
+
+  const companyName =
+    brief
+      ? brief.type === "quick"
+        ? (brief as QuickBriefResult).name
+        : (brief as FullBriefResult).detection.name
+      : slug;
 
   return (
     <>
       <TopNav showSearch />
-      <SideNav />
 
-      <main className="ml-64 pt-16 min-h-screen">
-        <div className="max-w-container-max mx-auto px-margin-desktop py-12">
-
-          {/* Header */}
-          <header
-            id="overview"
-            className="flex flex-col md:flex-row justify-between items-start md:items-end mb-12 border-b border-outline-variant pb-8 gap-6"
-          >
-            <div>
-              <div className="flex items-center gap-4 mb-2">
-                <h1 className="font-headline-lg text-headline-lg text-on-surface">
-                  {company.name}
-                </h1>
-                <span className="font-data-mono text-data-mono px-2 py-1 bg-surface-container-highest text-primary border border-outline-variant">
-                  TICKER: {company.ticker}
-                </span>
-              </div>
-              <div className="flex items-baseline gap-4">
-                <span className="font-display-lg text-display-lg">{company.price}</span>
-                <span
-                  className={`font-data-mono ${company.positive ? "text-primary" : "text-error"}`}
-                >
-                  {company.changePct} ({company.change}) TODAY
-                </span>
-              </div>
-            </div>
-
-            {/* Sparkline */}
-            <div className="w-full md:w-64 h-24 relative overflow-hidden">
-              <svg className="w-full h-full" viewBox="0 0 100 40" preserveAspectRatio="none">
-                <defs>
-                  <linearGradient id="goldGradient" x1="0" x2="0" y1="0" y2="1">
-                    <stop offset="0%" stopColor="#e9c176" />
-                    <stop offset="100%" stopColor="transparent" />
-                  </linearGradient>
-                </defs>
-                <path
-                  d="M0 35 Q 20 10, 40 25 T 80 5 T 100 15"
-                  fill="none"
-                  stroke="#e9c176"
-                  strokeWidth="2"
-                  vectorEffect="non-scaling-stroke"
-                />
-                <path
-                  d="M0 35 Q 20 10, 40 25 T 80 5 T 100 15 V 40 H 0 Z"
-                  fill="url(#goldGradient)"
-                  opacity="0.1"
-                />
-              </svg>
-            </div>
-          </header>
-
-          {/* Grid */}
-          <div className="grid grid-cols-12 gap-gutter">
-
-            {/* Executive Summary */}
-            <section className="col-span-12 lg:col-span-8 space-y-6">
-              <h3 className="font-label-caps text-label-caps text-primary border-b border-outline-variant pb-2 inline-block">
-                Executive Summary
-              </h3>
-              <p className="font-headline-md text-headline-md leading-relaxed text-on-surface-variant">
-                {company.summary[0]}
-              </p>
-              {company.summary[1] && (
-                <p className="font-body-lg text-body-lg text-on-surface/80">
-                  {company.summary[1]}
-                </p>
-              )}
-            </section>
-
-            {/* Key Metrics */}
-            <section
-              id="metrics"
-              className="col-span-12 lg:col-span-4 bg-surface-container-low border border-outline-variant p-gutter h-fit"
+      {brief ? (
+        <>
+          <SideNav
+            type={briefType as "company" | "institution"}
+            companyName={companyName}
+          />
+          {brief.type === "quick" ? (
+            <QuickBriefDisplay
+              brief={brief as QuickBriefResult}
+              onSave={handleSave}
+            />
+          ) : (
+            <BriefDisplay
+              brief={brief as FullBriefResult}
+              onShare={handleShare}
+              onSave={handleSave}
+            />
+          )}
+        </>
+      ) : error ? (
+        <div className="ml-64 pt-16 min-h-screen flex items-center justify-center">
+          <div className="max-w-md text-center px-8">
+            <span className="material-symbols-outlined text-5xl text-error mb-4 block">
+              error_outline
+            </span>
+            <h2 className="font-headline-md text-headline-md text-on-surface mb-3">
+              Brief Generation Failed
+            </h2>
+            <p className="font-body-md text-on-surface-variant mb-6">{error}</p>
+            <button
+              onClick={() => {
+                setError(null);
+                hasFetched.current = false;
+                setBrief(null);
+                setStepStatuses(["idle", "idle", "idle", "idle"]);
+                setCurrentStep(0);
+                loadBrief();
+              }}
+              className="px-6 py-3 bg-primary text-on-primary font-label-caps text-label-caps hover:bg-primary-container transition-colors"
             >
-              <h3 className="font-label-caps text-label-caps text-primary mb-6">Key Metrics</h3>
-              <div className="grid grid-cols-2 gap-y-8 gap-x-4">
-                {company.metrics.map((m) => (
-                  <div key={m.label} className="border-l border-outline-variant pl-4">
-                    <p className="font-label-caps text-label-caps text-on-tertiary-fixed-variant mb-1">
-                      {m.label}
-                    </p>
-                    <p className="font-data-mono text-xl text-on-surface">{m.value}</p>
-                  </div>
-                ))}
-              </div>
-              <button className="w-full mt-8 bg-primary text-on-primary py-3 font-label-caps text-label-caps hover:bg-primary-container transition-colors duration-200">
-                Download Full Statement
-              </button>
-            </section>
-
-            {/* Leadership */}
-            <section id="leadership" className="col-span-12 py-12 border-y border-outline-variant mt-12">
-              <h3 className="font-label-caps text-label-caps text-primary mb-8">Leadership</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-gutter">
-                {company.leaders.map((leader) => (
-                  <div
-                    key={leader.name}
-                    className="flex items-center gap-6 p-6 border border-outline-variant bg-surface-container-lowest"
-                  >
-                    <div className="w-24 h-24 flex-shrink-0 grayscale hover:grayscale-0 transition-all duration-500 overflow-hidden">
-                      <img
-                        alt={leader.name}
-                        className="w-full h-full object-cover"
-                        src={leader.imgSrc}
-                      />
-                    </div>
-                    <div>
-                      <h4 className="font-headline-md text-headline-md text-on-surface">
-                        {leader.name}
-                      </h4>
-                      <p className="font-label-caps text-label-caps text-primary mb-2">
-                        {leader.title}
-                      </p>
-                      <p className="text-sm text-on-surface-variant max-w-sm">
-                        {leader.description}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-
-            {/* Banking Context */}
-            <section id="banking" className="col-span-12 lg:col-span-7 mt-8">
-              <h3 className="font-label-caps text-label-caps text-primary mb-6">Banking Context</h3>
-              <div className="space-y-6">
-                <div className="p-6 border border-outline-variant">
-                  <h4 className="font-headline-md text-headline-md text-on-surface mb-4">
-                    Advisory &amp; Institutional Footprint
-                  </h4>
-                  <div className="space-y-4">
-                    {company.bankingRows.map((row) => (
-                      <div
-                        key={row.label}
-                        className="flex justify-between items-center border-b border-outline-variant/30 pb-2"
-                      >
-                        <span className="text-on-surface-variant font-body-md">{row.label}</span>
-                        {row.bar ? (
-                          <div className="flex gap-1 items-center">
-                            <div className="h-2 w-12 bg-primary" />
-                            <div className="h-2 w-8 bg-surface-container-highest" />
-                            <span className="ml-2 font-data-mono text-primary">{row.value}</span>
-                          </div>
-                        ) : (
-                          <span
-                            className={`font-data-mono ${row.highlight ? "text-primary" : "text-on-surface"}`}
-                          >
-                            {row.value}
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="p-6 border border-outline-variant bg-surface-container-high">
-                  <h4 className="font-label-caps text-label-caps text-on-surface mb-2">
-                    Recent Institutional Holdings
-                  </h4>
-                  <p className="text-sm text-on-surface-variant mb-4">
-                    Major positions maintained by Vanguard Group, BlackRock, and State Street Corp.
-                  </p>
-                  <div className="w-full h-32 bg-surface-container-lowest border border-outline-variant flex items-center justify-center">
-                    <span className="font-data-mono text-on-tertiary-fixed-variant text-xs">
-                      [Institutional Distribution Visualization]
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            {/* Market Intelligence / News */}
-            <section id="news" className="col-span-12 lg:col-span-5 mt-8">
-              <h3 className="font-label-caps text-label-caps text-primary mb-6">
-                Market Intelligence
-              </h3>
-              <div className="space-y-4">
-                {company.news.map((item, i) => (
-                  <div
-                    key={i}
-                    className={`p-4 bg-surface-container-lowest border-l transition-colors cursor-pointer
-                      ${i === 0 ? "border-primary" : "border-outline-variant hover:border-primary"}`}
-                  >
-                    <div className="flex justify-between text-xs font-data-mono text-on-tertiary-fixed-variant mb-1">
-                      <span>{item.source}</span>
-                      <span>{item.timeAgo}</span>
-                    </div>
-                    <h4 className="font-body-lg text-on-surface font-semibold leading-tight hover:text-primary transition-colors">
-                      {item.headline}
-                    </h4>
-                  </div>
-                ))}
-              </div>
-            </section>
+              Try Again
+            </button>
           </div>
         </div>
+      ) : (
+        <>
+          <SideNav companyName={slug} />
+          <LoadingSteps
+            currentStep={currentStep}
+            stepStatuses={stepStatuses}
+            companyName={slug}
+          />
+        </>
+      )}
 
-        <Footer />
-      </main>
+      {/* Shared brief notice */}
+      {isShared && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
+          <div className="px-4 py-2 bg-surface-container-highest border border-outline-variant font-label-caps text-label-caps text-on-surface-variant">
+            Shared brief — expires in 30 days · Generated by Brief
+          </div>
+        </div>
+      )}
+
+      {/* Toast notifications */}
+      {shareToast && (
+        <div className="fixed top-20 right-6 z-50 px-4 py-3 bg-primary text-on-primary font-label-caps text-label-caps shadow-lg">
+          Share link copied to clipboard
+        </div>
+      )}
+      {saveToast && (
+        <div className="fixed top-20 right-6 z-50 px-4 py-3 bg-primary text-on-primary font-label-caps text-label-caps shadow-lg">
+          Saved to Watchlist
+        </div>
+      )}
     </>
   );
 }

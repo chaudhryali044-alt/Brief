@@ -4,19 +4,24 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-export default function TopNav({ showSearch = false }: { showSearch?: boolean }) {
+interface Props {
+  showSearch?: boolean;
+}
+
+export default function TopNav({ showSearch = false }: Props) {
   const router = useRouter();
   const [query, setQuery] = useState("");
 
   function handleSearch(e: React.FormEvent) {
     e.preventDefault();
-    const trimmed = query.trim().toUpperCase();
-    if (trimmed) router.push(`/brief/${trimmed}`);
+    const trimmed = query.trim();
+    if (trimmed) router.push(`/brief/${encodeURIComponent(trimmed)}?mode=full`);
   }
 
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 bg-surface border-b border-outline-variant">
       <div className="flex justify-between items-center w-full px-margin-desktop h-16 max-w-container-max mx-auto">
+        {/* Left: Logo + nav */}
         <div className="flex items-center gap-8">
           <Link
             href="/"
@@ -25,12 +30,22 @@ export default function TopNav({ showSearch = false }: { showSearch?: boolean })
             Brief
           </Link>
           <div className="hidden md:flex gap-6">
-            <a className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200" href="#">Market</a>
-            <a className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200" href="#">Insights</a>
-            <a className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200" href="#">Portfolio</a>
-            <a className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200" href="#">Advisory</a>
+            <Link
+              href="/watchlist"
+              className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200"
+            >
+              Watchlist
+            </Link>
+            <Link
+              href="/about"
+              className="text-on-surface-variant font-medium hover:text-primary transition-colors duration-200"
+            >
+              About
+            </Link>
           </div>
         </div>
+
+        {/* Right: Search + icons */}
         <div className="flex items-center gap-4">
           {showSearch && (
             <form onSubmit={handleSearch} className="relative hidden md:block">
